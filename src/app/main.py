@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import qInstallMessageHandler, QtMsgType
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
 if __package__ in {None, ""}:
@@ -24,7 +25,14 @@ def _filter_qt_monitor_warning(message_type: QtMsgType, context, message: str) -
 def main() -> int:
     qInstallMessageHandler(_filter_qt_monitor_warning)
     app = QApplication(sys.argv)
+    icon_path = Path(__file__).resolve().parent / "assets" / "icon.png"
+    if icon_path.exists():
+        app_icon = QIcon(str(icon_path))
+        app.setWindowIcon(app_icon)
     window = MainWindow()
+    if icon_path.exists():
+        window.setWindowIcon(app.windowIcon())
+    app.aboutToQuit.connect(window.shutdown)
     window.show()
     return app.exec()
 

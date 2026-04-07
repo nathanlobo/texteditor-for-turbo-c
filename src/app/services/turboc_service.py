@@ -31,21 +31,33 @@ class TurboCService:
         ]
         result = self._dosbox.run_dos_commands(dosbox_exe, turboc_root, project_root, commands)
 
-        output_text = result.output
+        output_parts: list[str] = []
+        if result.output.strip():
+            output_parts.append(result.output.strip())
+
         if compile_log_path.exists():
             try:
                 file_output = compile_log_path.read_text(encoding="cp1252", errors="replace").strip()
                 if file_output:
-                    output_text = file_output
+                    output_parts.append(file_output)
             except OSError:
                 pass
 
+        output_text = "\n".join(part for part in output_parts if part).strip() or result.output
+
         diagnostics = parse_diagnostics(output_text)
-        rendered = f"[FILE] {real_file_path}\n" + "\n".join(
+        rendered_lines = [
+            f"[FILE] {real_file_path}",
+            "[DIAGNOSTICS]",
+        ]
+        rendered_lines.extend(
             f"[{d.severity.value.upper()}] "
             f"{f'{d.file}:{d.line} ' if d.file and d.line else ''}{d.message}"
             for d in diagnostics
         )
+        rendered_lines.append("[RAW OUTPUT]")
+        rendered_lines.append(output_text or "(no output)")
+        rendered = "\n".join(rendered_lines)
 
         result_with_output = ActionResult(ok=result.ok, output=output_text, return_code=result.return_code)
         return result_with_output, rendered
@@ -56,4 +68,4 @@ class TurboCService:
             "d:",
             normalized_executable,
         ]
-        return self._dosbox.start_program_session(dosbox_exe, turboc_root, project_root, run_commands)
+        return self._dosbox.start_program_session(dosbox_exe, turboc_root, project_root, run_commands, fullscreen=True)

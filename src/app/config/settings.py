@@ -9,6 +9,8 @@ class AppSettings:
     dosbox_exe: str = ""
     turboc_root: str = ""
     project_root: str = ""
+    window_geometry: str = ""
+    window_display_mode: str = "normal"
 
     def to_dict(self) -> dict[str, str]:
         return asdict(self)
@@ -19,6 +21,8 @@ class AppSettings:
             dosbox_exe=data.get("dosbox_exe", ""),
             turboc_root=data.get("turboc_root", ""),
             project_root=data.get("project_root", ""),
+            window_geometry=data.get("window_geometry", ""),
+            window_display_mode=data.get("window_display_mode", "normal"),
         )
 
     def validate(self) -> list[str]:
