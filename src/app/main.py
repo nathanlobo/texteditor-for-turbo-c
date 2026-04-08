@@ -6,17 +6,19 @@ import threading
 import traceback
 from pathlib import Path
 
-from PySide6.QtCore import qInstallMessageHandler, QtMsgType
-from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import QApplication, QMessageBox
-
-from .resources import asset_path
+from PySide6.QtCore import qInstallMessageHandler, QtMsgType, Qt
+from PySide6.QtGui import QColor, QIcon, QPixmap
+from PySide6.QtWidgets import QApplication, QMessageBox, QSplashScreen
 
 if __package__ in {None, ""}:
     # Allow running as `python src/app/main.py`.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from src.app.config.storage import SettingsStorage
+    from src.app.resources import asset_path
     from src.app.ui.main_window import MainWindow
 else:
+    from .config.storage import SettingsStorage
+    from .resources import asset_path
     from .ui.main_window import MainWindow
 
 
@@ -98,6 +100,40 @@ class TurboCApplication(QApplication):
             return False
 
 
+def _build_loading_splash(icon_path: Path) -> QSplashScreen:
+    splash_pixmap = QPixmap(str(icon_path)) if icon_path.exists() else QPixmap()
+    if splash_pixmap.isNull():
+        splash_pixmap = QPixmap(520, 280)
+        splash_pixmap.fill(QColor("#101722"))
+    else:
+        splash_pixmap = splash_pixmap.scaled(
+            520,
+            280,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+
+    splash = QSplashScreen(splash_pixmap)
+    splash.showMessage(
+        "Loading Turbo C Editor...",
+        Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignHCenter,
+        QColor("#e6edf3"),
+    )
+    return splash
+
+
+def _is_valid_directory_text(path_text: str) -> bool:
+    if not str(path_text).strip():
+        return False
+    path = Path(path_text).expanduser()
+    return path.exists() and path.is_dir()
+
+
+def _should_show_loading_splash() -> bool:
+    settings = SettingsStorage().load()
+    return _is_valid_directory_text(settings.turboc_root) and _is_valid_directory_text(settings.project_root)
+
+
 def main() -> int:
     qInstallMessageHandler(_handle_qt_message)
     sys.excepthook = _handle_unhandled_exception
@@ -110,23 +146,34 @@ def main() -> int:
 
     app = TurboCApplication(sys.argv)
     app.setApplicationName("Turbo C Editor")
-    app.setApplicationDisplayName("Turbo C Editor By Nathan Lobo")
+    app.setApplicationDisplayName("Turbo C Editor")
     app.setOrganizationName("Codinx")
     app.setApplicationVersion("1.0.0")
 
+    splash: QSplashScreen | None = None
     try:
         app_icon_path = asset_path("dos-codinx.ico")
         if app_icon_path.exists():
             app_icon = QIcon(str(app_icon_path))
             app.setWindowIcon(app_icon)
+
+        if _should_show_loading_splash():
+            splash = _build_loading_splash(app_icon_path)
+            splash.show()
+            app.processEvents()
+
         window = MainWindow()
         if app_icon_path.exists():
             window.setWindowIcon(app.windowIcon())
         app.aboutToQuit.connect(window.shutdown)
         window.show()
+        if splash is not None:
+            splash.finish(window)
         exit_code = app.exec()
         return 1 if _fatal_error_reported else exit_code
     except Exception as exception:
+        if splash is not None:
+            splash.close()
         _report_fatal_error(_format_exception_details(exception))
         return 1
 

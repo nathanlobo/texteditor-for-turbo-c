@@ -22,10 +22,8 @@ class TurboCService:
         return turbo_path / "_build" / self._build_key(project_root)
 
     def _sync_project_to_build_root(self, project_root: Path, build_root: Path) -> None:
-        if build_root.exists():
-            shutil.rmtree(build_root)
-
         build_root.parent.mkdir(parents=True, exist_ok=True)
+        build_root.mkdir(parents=True, exist_ok=True)
         shutil.copytree(
             project_root,
             build_root,
@@ -47,6 +45,7 @@ class TurboCService:
                 "TCBUILD.LOG",
                 "TCSAFE.*",
             ),
+            dirs_exist_ok=True,
         )
 
     def _relocate_generated_artifacts(self, project_root: Path, build_root: Path) -> None:
@@ -65,12 +64,18 @@ class TurboCService:
             if file_name == "tcbuild.log" or file_name.startswith("tcsafe.") or file_path.suffix.lower() in generated_suffixes:
                 destination = build_root / relative_path
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                if destination.exists():
-                    destination.unlink()
-                shutil.move(str(file_path), str(destination))
+                try:
+                    if destination.exists():
+                        destination.unlink()
+                    shutil.move(str(file_path), str(destination))
+                except OSError:
+                    # If the build artifact is in use by another process, keep going.
+                    continue
 
     def compile(self, dosbox_exe: str, turboc_root: str, project_root: str, source_file: str) -> tuple[ActionResult, str]:
-        normalized_source = source_file.replace("/", "\\")
+        normalized_source = source_file.replace("/", "\\").lstrip("\\")
+        if normalized_source.startswith(".\\"):
+            normalized_source = normalized_source[2:]
         project_path = Path(project_root).resolve()
         build_root = self._build_root(turboc_root, project_root)
         self._sync_project_to_build_root(project_path, build_root)
@@ -78,7 +83,7 @@ class TurboCService:
 
         turbo_path = Path(turboc_root).resolve()
         dos_turbo_root = f"C:\\{turbo_path.name}"
-        dos_build_root = f"{dos_turbo_root}\\_build\\{build_root.name}"
+        source_in_build = normalized_source
         # Use an 8.3 filename so DOS redirection writes exactly the expected file.
         compile_log_name = "TCBUILD.LOG"
         compile_log_path = build_root / compile_log_name
@@ -88,8 +93,8 @@ class TurboCService:
             "d:",
             # Set PATH to include BIN so tlink.exe can be found during linking.
             f"PATH {dos_turbo_root}\\BIN;%PATH%",
-            # Compile with explicit include/lib paths to match IDE behavior.
-            f"{dos_turbo_root}\\BIN\\TCC.EXE -I{dos_turbo_root}\\INCLUDE -L{dos_turbo_root}\\LIB {dos_build_root}\\{normalized_source} {dos_turbo_root}\\LIB\\GRAPHICS.LIB > d:\\{compile_log_name}",
+            # Compile from D: (build root) so the source path stays short and DOS-friendly.
+            f"{dos_turbo_root}\\BIN\\TCC.EXE -I{dos_turbo_root}\\INCLUDE -L{dos_turbo_root}\\LIB {source_in_build} {dos_turbo_root}\\LIB\\GRAPHICS.LIB > d:\\{compile_log_name}",
         ]
         result = self._dosbox.run_dos_commands(dosbox_exe, turboc_root, str(build_root), commands)
 

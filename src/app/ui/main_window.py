@@ -185,7 +185,7 @@ class ThemeSwitch(QCheckBox):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Turbo C Editor By Nathan Lobo")
+        self.setWindowTitle("Turbo C Editor")
         self._about_version = "1.0.0"
         self.resize(1440, 900)
 
@@ -2010,10 +2010,19 @@ class MainWindow(QMainWindow):
 
     def _source_argument_for_build(self, source: Path) -> str:
         project_root = Path(self._settings.project_root).resolve()
+        source_path = source.resolve()
         try:
-            return str(source.resolve().relative_to(project_root))
+            common_prefix = os.path.commonpath([str(project_root), str(source_path)])
         except ValueError:
             return source.name
+
+        if os.path.normcase(common_prefix) != os.path.normcase(str(project_root)):
+            return source.name
+
+        relative_source = os.path.relpath(str(source_path), str(project_root))
+        if relative_source in {"", "."}:
+            return source.name
+        return relative_source.replace("/", "\\")
 
     def _on_compile(self) -> None:
         if not self._ensure_valid_settings():
