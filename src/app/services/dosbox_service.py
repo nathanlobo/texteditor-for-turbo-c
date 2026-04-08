@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import subprocess
 from pathlib import Path
+from tempfile import gettempdir
 
+from ..config.settings import resolve_dosbox_executable_path
 from ..domain.models import ActionResult, SessionState
 
 
@@ -11,32 +14,72 @@ class DosBoxService:
         self._process: subprocess.Popen[str] | None = None
         self.state = SessionState.STOPPED
 
+    def _compatibility_root(self, turboc_root: str, project_root: str) -> Path:
+        turbo_path = Path(turboc_root).resolve()
+        project_path = Path(project_root).resolve()
+        cache_key = hashlib.sha1(f"{turbo_path}|{project_path}".encode("utf-8")).hexdigest()[:16]
+        root = Path(gettempdir()) / "turbo-c-upgrade" / "dosbox" / cache_key
+        root.mkdir(parents=True, exist_ok=True)
+
+        alias_targets = {
+            "TC": turbo_path,
+            "TURBOC3": turbo_path,
+            "PROJECT": project_path,
+        }
+
+        for alias_name, target_path in alias_targets.items():
+            alias_path = root / alias_name
+            if alias_path.exists():
+                continue
+            if not self._create_directory_link(alias_path, target_path):
+                raise OSError(f"Unable to create DOSBox alias {alias_name} -> {target_path}")
+
+        return root
+
+    def _create_directory_link(self, link_path: Path, target_path: Path) -> bool:
+        try:
+            link_path.symlink_to(target_path, target_is_directory=True)
+            return True
+        except OSError:
+            pass
+
+        completed = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link_path), str(target_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return completed.returncode == 0
+
+    def _resolve_dosbox_path(self, dosbox_exe: str, turboc_root: str) -> Path | None:
+        return resolve_dosbox_executable_path(dosbox_exe, turboc_root)
+
     def start_turboc_session(self, dosbox_exe: str, turboc_root: str, project_root: str) -> ActionResult:
         if self._process and self._process.poll() is None:
             self.state = SessionState.RUNNING
             return ActionResult(ok=True, output="DOSBox session already running.")
 
-        dosbox_path = Path(dosbox_exe)
+        dosbox_path = self._resolve_dosbox_path(dosbox_exe, turboc_root)
         turbo_path = Path(turboc_root)
         proj_path = Path(project_root)
 
-        if not dosbox_path.exists():
+        if dosbox_path is None:
             self.state = SessionState.ERROR
-            return ActionResult(ok=False, output="DOSBox executable not found.")
+            return ActionResult(ok=False, output="Unable to locate DOSBox.exe from the Turbo C root.")
 
         self.state = SessionState.STARTING
-        turbo_path = Path(turboc_root)
+        compatibility_root = self._compatibility_root(turboc_root, project_root)
         commands = [
             str(dosbox_path),
             "-noconsole",
             "-c",
-            f"mount c \"{turbo_path.parent}\"",
+            f"mount c \"{compatibility_root}\"",
             "-c",
             f"mount d \"{proj_path}\"",
             "-c",
             "c:",
             "-c",
-            f"cd \\{turbo_path.name}\\BIN",
+            "cd \\TC\\BIN",
             "-c",
             "TC.EXE",
         ]
@@ -113,10 +156,13 @@ class DosBoxService:
             return None
 
         safe_lines: list[str] = []
+        blocked_events = {"key_altenter", "key_ctrlesc", "key_ctrlesc"}
         for line in content.splitlines():
             stripped = line.strip()
             if stripped.startswith("key_"):
                 event_name = stripped.split()[0]
+                if event_name in blocked_events:
+                    continue
                 # Keep DOSBox function keys available, suppress most key events to
                 # reduce accidental host-shortcut leakage into DOS programs.
                 if event_name.startswith("key_f"):
@@ -132,6 +178,7 @@ class DosBoxService:
                 "[sdl]\n"
                 "usescancodes=false\n"
                 f"fullscreen={'true' if fullscreen else 'false'}\n"
+                f"windowresolution={'1024x768' if not fullscreen else 'desktop'}\n"
                 f"mapperfile={safe_mapper_path}\n",
                 encoding="utf-8",
             )
@@ -148,20 +195,22 @@ class DosBoxService:
         run_commands: list[str],
         *,
         fullscreen: bool = False,
+        close_on_any_key: bool = False,
     ) -> ActionResult:
-        dosbox_path = Path(dosbox_exe)
+        dosbox_path = self._resolve_dosbox_path(dosbox_exe, turboc_root)
         turbo_path = Path(turboc_root)
         proj_path = Path(project_root)
 
-        if not dosbox_path.exists():
+        if dosbox_path is None:
             self.state = SessionState.ERROR
-            return ActionResult(ok=False, output="DOSBox executable not found.")
+            return ActionResult(ok=False, output="Unable to locate DOSBox.exe from the Turbo C root.")
 
         if self._process and self._process.poll() is None:
             self._process.terminate()
 
         self.state = SessionState.STARTING
-        safe_conf_path = self._create_shortcut_safe_conf(dosbox_exe, turboc_root, project_root, fullscreen=fullscreen)
+        compatibility_root = self._compatibility_root(turboc_root, project_root)
+        safe_conf_path = self._create_shortcut_safe_conf(str(dosbox_path), turboc_root, project_root, fullscreen=fullscreen)
         commands = [
             str(dosbox_path),
         ]
@@ -175,17 +224,20 @@ class DosBoxService:
         commands.extend([
             "-noconsole",
             "-c",
-            f"mount c \"{turbo_path.parent}\"",
+            f"mount c \"{compatibility_root}\"",
             "-c",
             f"mount d \"{proj_path}\"",
             "-c",
             "c:",
             "-c",
-            f"PATH C:\\{turbo_path.name}\\BIN;%PATH%",
+            "PATH C:\\TC\\BIN;%PATH%",
         ])
 
         for command in run_commands:
             commands.extend(["-c", command])
+
+        if close_on_any_key:
+            commands.extend(["-c", "pause", "-c", "exit"])
 
         try:
             self._process = subprocess.Popen(
@@ -199,15 +251,15 @@ class DosBoxService:
                 return ActionResult(
                     ok=True,
                     output=(
-                        f"Program started in DOSBox {'fullscreen ' if fullscreen else ''}(shortcut-safe mode). "
-                        "Close DOSBox or click Stop Session when done."
+                        f"Program started in DOSBox {'fullscreen ' if fullscreen else 'windowed '}(shortcut-safe mode). "
+                        "Press any key to close it."
                     ),
                 )
             return ActionResult(
                 ok=True,
                 output=(
-                    f"Program started in DOSBox {'fullscreen ' if fullscreen else ''}. "
-                    "Close DOSBox or click Stop Session when done."
+                        f"Program started in DOSBox {'fullscreen ' if fullscreen else 'windowed '}. "
+                    "Press any key to close it."
                 ),
             )
         except OSError as exc:
@@ -221,13 +273,13 @@ class DosBoxService:
         project_root: str,
         commands: list[str],
     ) -> ActionResult:
-        dosbox_path = Path(dosbox_exe)
-        if not dosbox_path.exists():
-            return ActionResult(ok=False, output="DOSBox executable not found.")
+        dosbox_path = self._resolve_dosbox_path(dosbox_exe, turboc_root)
+        if dosbox_path is None:
+            return ActionResult(ok=False, output="Unable to locate DOSBox.exe from the Turbo C root.")
 
         args: list[str] = [str(dosbox_path), "-noconsole"]
-        turbo_path = Path(turboc_root)
-        args.extend(["-c", f"mount c \"{turbo_path.parent}\""])
+        compatibility_root = self._compatibility_root(turboc_root, project_root)
+        args.extend(["-c", f"mount c \"{compatibility_root}\""])
         args.extend(["-c", f"mount d \"{Path(project_root)}\""])
         args.extend(["-c", "c:"])
 

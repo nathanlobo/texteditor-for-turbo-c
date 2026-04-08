@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import base64
+import os
+import subprocess
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QByteArray, QDir, QEvent, QPoint, QSize, Qt, QTimer
-from PySide6.QtGui import QAction, QCloseEvent, QIcon, QKeyEvent, QKeySequence, QPixmap
+from PySide6.QtCore import QByteArray, QFile, QDir, QEvent, QPoint, QRectF, QSize, Qt, QTimer, QUrl, QMimeData
+from PySide6.QtGui import QAction, QCloseEvent, QColor, QDesktopServices, QFontDatabase, QIcon, QKeyEvent, QKeySequence, QPalette, QPainter, QPen, QPixmap, QTextCursor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
+    QDialog,
     QFrame,
     QFileDialog,
     QFileSystemModel,
@@ -16,6 +20,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QInputDialog,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -25,26 +30,169 @@ from PySide6.QtWidgets import (
     QSplitter,
     QToolButton,
     QTreeView,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
-from ..config.settings import AppSettings
+from ..config.settings import AppSettings, resolve_dosbox_executable_path
 from ..config.storage import SettingsStorage
 from ..domain.models import Severity
+from ..resources import asset_path
 from ..services.diagnostics_parser import parse_diagnostics
 from ..services.dosbox_service import DosBoxService
 from ..services.turboc_service import TurboCService
+from .file_icon_provider import ExtensionIconProvider
+from .syntax_highlighter import CFamilySyntaxHighlighter
+
+
+class CodeEditor(QPlainTextEdit):
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() == Qt.Key.Key_Tab and event.modifiers() == Qt.KeyboardModifier.NoModifier:
+            cursor = self.textCursor()
+            cursor.beginEditBlock()
+            cursor.insertText("    ")
+            cursor.endEditBlock()
+            self.setTextCursor(cursor)
+            return
+
+        if event.key() in {Qt.Key.Key_Return, Qt.Key.Key_Enter} and event.modifiers() == Qt.KeyboardModifier.NoModifier:
+            cursor = self.textCursor()
+            if not cursor.hasSelection():
+                block_text = cursor.block().text()
+                leading_whitespace = []
+                for character in block_text:
+                    if character in {" ", "\t"}:
+                        leading_whitespace.append(character)
+                    else:
+                        break
+
+                cursor.beginEditBlock()
+                cursor.insertBlock()
+                if leading_whitespace:
+                    cursor.insertText("".join(leading_whitespace))
+                cursor.endEditBlock()
+                self.setTextCursor(cursor)
+                return
+
+        super().keyPressEvent(event)
+
+
+class ThemeSwitch(QCheckBox):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._theme_mode = "light"
+        self.setText("")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+
+    def set_theme_mode(self, theme_mode: str) -> None:
+        mode = str(theme_mode).lower()
+        if mode not in {"light", "dark"}:
+            mode = "light"
+        if mode == self._theme_mode:
+            return
+        self._theme_mode = mode
+        self.update()
+
+    def sizeHint(self) -> QSize:
+        height = max(18, self.fontMetrics().height() + 6)
+        width = max(34, round(height * 1.9))
+        return QSize(width, height)
+
+    def minimumSizeHint(self) -> QSize:
+        return self.sizeHint()
+
+    def hitButton(self, pos: QPoint) -> bool:
+        return self.rect().contains(pos)
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+            rect = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+            if rect.width() <= 0 or rect.height() <= 0:
+                return
+
+            checked = self.isChecked()
+            enabled = self.isEnabled()
+
+            if self._theme_mode == "dark":
+                off_track = QColor("#4b4b4b")
+                off_border = QColor("#5a5a5a")
+                on_track = QColor("#0e639c")
+                on_border = QColor("#1177bb")
+                knob_fill = QColor("#f8f9fb")
+                knob_border = QColor("#c8d0da")
+                shadow = QColor(0, 0, 0, 70)
+                focus = QColor("#4fc1ff")
+                disabled_track = QColor("#343434")
+                disabled_border = QColor("#474747")
+            else:
+                off_track = QColor("#d0d7de")
+                off_border = QColor("#b7c0ca")
+                on_track = QColor("#0e639c")
+                on_border = QColor("#0d5a8c")
+                knob_fill = QColor("#ffffff")
+                knob_border = QColor("#b8c2cc")
+                shadow = QColor(0, 0, 0, 35)
+                focus = QColor("#0e639c")
+                disabled_track = QColor("#d7dbe0")
+                disabled_border = QColor("#c4ccd5")
+
+            track_color = on_track if checked else off_track
+            border_color = on_border if checked else off_border
+            if not enabled:
+                track_color = disabled_track
+                border_color = disabled_border
+
+            radius = rect.height() / 2.0
+            painter.setPen(QPen(border_color, 1))
+            painter.setBrush(track_color)
+            painter.drawRoundedRect(rect, radius, radius)
+
+            knob_margin = max(2, round(rect.height() * 0.16))
+            knob_size = rect.height() - (knob_margin * 2)
+            if knob_size > 0:
+                knob_y = rect.top() + knob_margin
+                if checked:
+                    knob_x = rect.right() - knob_margin - knob_size
+                else:
+                    knob_x = rect.left() + knob_margin
+
+                knob_rect = QRectF(knob_x, knob_y, knob_size, knob_size)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(shadow)
+                painter.drawEllipse(knob_rect.translated(1, 1))
+                painter.setBrush(knob_fill)
+                painter.drawEllipse(knob_rect)
+                painter.setPen(QPen(knob_border, 1))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawEllipse(knob_rect)
+
+            if self.hasFocus():
+                focus_color = QColor(focus)
+                focus_color.setAlpha(120)
+                painter.setPen(QPen(focus_color, 1))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawRoundedRect(rect.adjusted(-1, -1, 1, 1), radius + 1, radius + 1)
+        finally:
+            painter.end()
 
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Editor for Turbo C by Nathan Lobo")
+        self.setWindowTitle("Turbo C Editor By Nathan Lobo")
+        self._about_version = "1.0.0"
         self.resize(1440, 900)
 
         self._storage = SettingsStorage()
         self._settings = self._storage.load()
+        self._theme_mode = self._normalize_theme_mode(self._settings.theme_mode)
+        self._settings.theme_mode = self._theme_mode
         self._workspace_root = self._initial_workspace_root()
         self._selected_source_file: Path | None = None
         self._current_editor_file: Path | None = None
@@ -60,15 +208,30 @@ class MainWindow(QMainWindow):
         self._zoom_step = 0.08
         self._zoom_min_level = -2
         self._zoom_max_level = 8
-        self._zoom_level = 0
-        self._ui_scale = self._zoom_base_scale
+        self._zoom_level = max(
+            self._zoom_min_level,
+            min(self._zoom_max_level, int(getattr(self._settings, "zoom_level", 0))),
+        )
+        self._settings.zoom_level = self._zoom_level
+        self._ui_scale = self._zoom_base_scale + (self._zoom_step * self._zoom_level)
+        self._output_panel_visible = True
+        self._code_highlighter: CFamilySyntaxHighlighter | None = None
 
         self._dosbox_service = DosBoxService()
         self._turbo_service = TurboCService(self._dosbox_service)
-        self._logo_path = Path(__file__).resolve().parents[1] / "assets" / "icon.png"
-        self._settings_icon_path = Path(__file__).resolve().parents[1] / "assets" / "settings.svg"
-        self._notification_icon_path = Path(__file__).resolve().parents[1] / "assets" / "bell.svg"
-        self._zoom_icon_path = Path(__file__).resolve().parents[1] / "assets" / "zoom.svg"
+        self._logo_path = asset_path("icon.png")
+        self._settings_icon_path = asset_path("settings.svg")
+        self._notification_icon_path = asset_path("bell.svg")
+        self._zoom_icon_path = asset_path("zoom.svg")
+        self._workspace_icon_provider = ExtensionIconProvider(self._theme_mode)
+        self._startup_prompt_shown = False
+        self._codinx_site_url = "https://codinx.app"
+        self._codinx_support_url = "https://codinx.app/support"
+        self._about_social_links = {
+            "GitHub": "https://codinx.app/github",
+            "Email": "https://codinx.app/email",
+            "WhatsApp": "https://codinx.app/whatsapp",
+        }
 
         self._build_actions()
         self._build_menus()
@@ -79,7 +242,7 @@ class MainWindow(QMainWindow):
         if app is not None:
             app.installEventFilter(self)
         self._restore_window_geometry()
-        self._set_workspace_root(self._workspace_root)
+        self._set_workspace_root(self._workspace_root, sync_project_input=bool(self._settings.project_root))
         self._refresh_source_display()
         self._refresh_view_actions()
         self._refresh_action_states()
@@ -169,6 +332,7 @@ class MainWindow(QMainWindow):
         self.act_run.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
 
         self.act_welcome = self._action("Welcome", self._show_welcome)
+        self.act_support = self._action("Support", self._open_support_page)
         self.act_feature_request = self._action("Feature request", enabled=False)
         self.act_report_issue = self._action("Report", enabled=False)
         self.act_check_updates = self._action("Check for updates", enabled=False)
@@ -244,7 +408,7 @@ class MainWindow(QMainWindow):
             self.run_menu.addAction(action)
 
         self.help_menu = QMenu(self)
-        for action in [self.act_welcome, self.act_feature_request, self.act_report_issue, self.act_check_updates, self.act_about]:
+        for action in [self.act_welcome, self.act_support, self.act_feature_request, self.act_report_issue, self.act_check_updates, self.act_about]:
             self.help_menu.addAction(action)
 
     def _build_ui(self) -> None:
@@ -265,13 +429,13 @@ class MainWindow(QMainWindow):
         sidebar_layout.setContentsMargins(0, 0, 0, 0)
         sidebar_layout.setSpacing(8)
         sidebar_layout.addWidget(self._build_explorer_card(), 1)
-        sidebar_layout.addWidget(self._build_settings_card())
+        self.settings_panel = self._build_settings_card()
+        self.settings_dialog = self._build_settings_dialog()
 
         self.main_panel_widget = QWidget(objectName="MainPanel")
         main_layout = QVBoxLayout(self.main_panel_widget)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(8)
-        main_layout.addWidget(self._build_run_bar())
         main_layout.addWidget(self._build_editor_card(), 1)
 
         self.body_splitter.addWidget(self.sidebar_widget)
@@ -290,8 +454,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.workspace_splitter, 1)
         layout.addWidget(self._build_footer())
 
-        self.settings_panel.setVisible(False)
-
     def showEvent(self, event) -> None:
         super().showEvent(event)
         if self._window_mode_restored:
@@ -302,6 +464,12 @@ class MainWindow(QMainWindow):
         elif self._settings.window_display_mode == "maximized":
             self.showMaximized()
         QTimer.singleShot(0, self._refresh_view_actions)
+        QTimer.singleShot(0, self._apply_output_panel_visibility)
+        self._prompt_for_missing_startup_paths()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._update_editor_file_label()
 
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.ShortcutOverride and isinstance(event, QKeyEvent):
@@ -327,21 +495,8 @@ class MainWindow(QMainWindow):
         top_layout.setContentsMargins(6, 4, 6, 4)
         top_layout.setSpacing(4)
 
-        self.logo_label = QLabel(objectName="LogoLabel")
         if self._logo_path.exists():
-            pixmap = QPixmap(str(self._logo_path))
-            self.logo_label.setPixmap(
-                pixmap.scaled(
-                    18,
-                    18,
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
-            )
             self.setWindowIcon(QIcon(str(self._logo_path)))
-        else:
-            self.logo_label.setText("TC")
-        top_layout.addWidget(self.logo_label)
 
         top_layout.addWidget(self._menu_button("File", self.file_menu))
         top_layout.addWidget(self._menu_button("Edit", self.edit_menu))
@@ -350,7 +505,18 @@ class MainWindow(QMainWindow):
         top_layout.addWidget(self._menu_button("Help", self.help_menu))
         top_layout.addStretch(1)
 
-        self.top_bar_title = QLabel("Editor for Turbo C by Nathan Lobo", objectName="TopBarTitle")
+        self.top_bar_logo = QLabel(objectName="TopBarLogo")
+        if self._logo_path.exists():
+            pixmap = QPixmap(str(self._logo_path)).scaled(
+                self._scaled(18),
+                self._scaled(18),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            self.top_bar_logo.setPixmap(pixmap)
+        top_layout.addWidget(self.top_bar_logo)
+
+        self.top_bar_title = QLabel("Turbo C Editor By Nathan Lobo", objectName="TopBarTitle")
         top_layout.addWidget(self.top_bar_title)
         return top_bar
 
@@ -362,6 +528,7 @@ class MainWindow(QMainWindow):
         button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         button.setMenu(menu)
         button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        button.setToolTip(text)
         return button
 
     def _build_explorer_card(self) -> QFrame:
@@ -374,6 +541,9 @@ class MainWindow(QMainWindow):
         header = QHBoxLayout()
         header.addWidget(QLabel("Explorer", objectName="SectionLabel"))
         header.addStretch(1)
+        self.create_folder_button = QPushButton("New Folder")
+        self.create_folder_button.clicked.connect(self._on_create_workspace_folder)
+        header.addWidget(self.create_folder_button)
         self.workspace_root_button = QPushButton("Open Folder")
         self.workspace_root_button.clicked.connect(self._on_open_workspace_folder)
         header.addWidget(self.workspace_root_button)
@@ -385,6 +555,7 @@ class MainWindow(QMainWindow):
 
         self.workspace_model = QFileSystemModel(self)
         self.workspace_model.setFilter(QDir.Filter.AllDirs | QDir.Filter.Files | QDir.Filter.NoDotAndDotDot)
+        self.workspace_model.setIconProvider(self._workspace_icon_provider)
         self.workspace_model.setRootPath(str(self._workspace_root))
 
         self.workspace_tree = QTreeView()
@@ -394,12 +565,15 @@ class MainWindow(QMainWindow):
         self.workspace_tree.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.workspace_tree.setAnimated(True)
         self.workspace_tree.setIndentation(18)
+        self.workspace_tree.setIconSize(QSize(self._scaled(28), self._scaled(28)))
         self.workspace_tree.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.workspace_tree.setColumnHidden(1, True)
         self.workspace_tree.setColumnHidden(2, True)
         self.workspace_tree.setColumnHidden(3, True)
         self.workspace_tree.clicked.connect(self._on_workspace_clicked)
         self.workspace_tree.doubleClicked.connect(self._on_workspace_double_clicked)
+        self.workspace_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.workspace_tree.customContextMenuRequested.connect(self._show_workspace_context_menu)
         layout.addWidget(self.workspace_tree, 1)
 
         self.source_info_label = QLabel(objectName="MutedLabel")
@@ -418,45 +592,90 @@ class MainWindow(QMainWindow):
         layout.setSpacing(6)
 
         layout.addWidget(QLabel("Environment", objectName="SectionLabel"))
+        note = QLabel("Turbo C root and project directory are required. DOSBox is auto-detected from the Turbo C root.")
+        note.setWordWrap(True)
+        note.setObjectName("MutedLabel")
+        layout.addWidget(note)
         form = QFormLayout()
         form.setSpacing(8)
         form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
-        self.dosbox_input = QLineEdit()
         self.turbo_input = QLineEdit()
         self.project_input = QLineEdit()
-        form.addRow("DOSBox executable", self.dosbox_input)
+        self.dosbox_path_label = QLabel(objectName="MutedLabel")
+        self.dosbox_path_label.setWordWrap(True)
+        self.dosbox_path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.turbo_input.textChanged.connect(self._update_dosbox_path_preview)
         form.addRow("Turbo C root", self.turbo_input)
         form.addRow("Project root", self.project_input)
+        form.addRow("DOSBox executable", self.dosbox_path_label)
         layout.addLayout(form)
+
+        self.fullscreen_output_checkbox = QCheckBox("Show output panel in fullscreen")
+        layout.addWidget(self.fullscreen_output_checkbox)
 
         self.save_settings_btn = QPushButton("Save Settings")
         self.save_settings_btn.clicked.connect(self._on_save_settings)
         layout.addWidget(self.save_settings_btn)
         return self.settings_panel
 
-    def _build_run_bar(self) -> QFrame:
-        card = QFrame(objectName="Card")
-        layout = QHBoxLayout(card)
-        layout.setContentsMargins(10, 8, 10, 8)
-        layout.setSpacing(6)
+    def _build_settings_dialog(self) -> QDialog:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Settings")
+        dialog.setWindowIcon(self.windowIcon())
+        dialog.setWindowFlag(Qt.WindowType.Tool, True)
+        dialog.setModal(False)
+        dialog.setMinimumWidth(self._scaled(520))
 
-        layout.addWidget(QLabel("Actions", objectName="SectionLabel"))
-        self.start_btn = QPushButton("Start Turbo C")
-        self.compile_btn = QPushButton("Compile")
-        self.run_btn = QPushButton("Run")
-        self.stop_btn = QPushButton("Stop Session")
-        self.compile_btn.setObjectName("PrimaryButton")
-        self.run_btn.setObjectName("PrimaryButton")
-        self.start_btn.clicked.connect(self._on_start)
-        self.compile_btn.clicked.connect(self._on_compile)
-        self.run_btn.clicked.connect(self._on_run)
-        self.stop_btn.clicked.connect(self._on_stop)
-        layout.addWidget(self.start_btn)
-        layout.addWidget(self.compile_btn)
-        layout.addWidget(self.run_btn)
-        layout.addWidget(self.stop_btn)
-        layout.addStretch(1)
-        return card
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(0)
+        layout.addWidget(self.settings_panel)
+
+        dialog.finished.connect(self._on_settings_dialog_closed)
+        return dialog
+
+    def _is_valid_directory(self, path_text: str) -> bool:
+        path = Path(path_text).expanduser()
+        return path.exists() and path.is_dir()
+
+    def _update_dosbox_path_preview(self) -> None:
+        if not hasattr(self, "dosbox_path_label"):
+            return
+
+        turbo_root = self.turbo_input.text().strip() if hasattr(self, "turbo_input") else self._settings.turboc_root
+        resolved = resolve_dosbox_executable_path("", turbo_root)
+        if resolved is not None:
+            self.dosbox_path_label.setText(str(resolved))
+            return
+
+        if turbo_root:
+            self.dosbox_path_label.setText("DOSBox.exe not found under the Turbo C root.")
+        else:
+            self.dosbox_path_label.setText("Set the Turbo C root to auto-detect DOSBox.exe.")
+
+    def _refresh_dosbox_path_from_settings(self) -> None:
+        resolved = resolve_dosbox_executable_path(self._settings.dosbox_exe, self._settings.turboc_root)
+        self._settings.dosbox_exe = str(resolved) if resolved is not None else ""
+        self._update_dosbox_path_preview()
+
+    def _prompt_for_missing_startup_paths(self) -> None:
+        if self._startup_prompt_shown:
+            return
+
+        needs_turbo_root = not self._is_valid_directory(self._settings.turboc_root)
+        needs_project_root = not self._is_valid_directory(self._settings.project_root)
+        if not needs_turbo_root and not needs_project_root:
+            return
+
+        self._startup_prompt_shown = True
+        self._apply_settings_to_form()
+        self._position_settings_dialog()
+        self._update_status("Select Turbo C root and project directory")
+        if needs_turbo_root:
+            self.turbo_input.setFocus()
+        else:
+            self.project_input.setFocus()
+        self.settings_dialog.exec()
 
     def _build_editor_card(self) -> QFrame:
         card = QFrame(objectName="Card")
@@ -468,30 +687,46 @@ class MainWindow(QMainWindow):
         header.addWidget(QLabel("Source Editor", objectName="SectionLabel"))
         header.addStretch(1)
         self.editor_file_label = QLabel(objectName="MutedLabel")
-        self.editor_file_label.setWordWrap(True)
-        header.addWidget(self.editor_file_label)
+        self.editor_file_label.setWordWrap(False)
+        self.editor_file_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.editor_file_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        header.addWidget(self.editor_file_label, 1)
+        header.addSpacing(self._scaled(4))
         layout.addLayout(header)
 
         toolbar = QHBoxLayout()
+        toolbar.setSpacing(6)
         self.new_file_btn = QPushButton("New File")
         self.open_file_btn = QPushButton("Open File")
         self.save_file_btn = QPushButton("Save File")
         self.save_as_btn = QPushButton("Save As")
+        self.compile_btn = QPushButton("Compile")
+        self.run_btn = QPushButton("Run")
+        self.compile_btn.setObjectName("PrimaryButton")
+        self.run_btn.setObjectName("PrimaryButton")
         self.new_file_btn.clicked.connect(self._on_new_file)
         self.open_file_btn.clicked.connect(self._on_open_file)
         self.save_file_btn.clicked.connect(self._on_save_file)
         self.save_as_btn.clicked.connect(self._on_save_as)
+        self.compile_btn.clicked.connect(self._on_compile)
+        self.run_btn.clicked.connect(self._on_run)
         toolbar.addWidget(self.new_file_btn)
         toolbar.addWidget(self.open_file_btn)
         toolbar.addWidget(self.save_file_btn)
         toolbar.addWidget(self.save_as_btn)
         toolbar.addStretch(1)
+        toolbar.addWidget(self.compile_btn)
+        toolbar.addWidget(self.run_btn)
         layout.addLayout(toolbar)
 
-        self.code_editor = QPlainTextEdit(objectName="CodeEditor")
+        self.code_editor = CodeEditor(objectName="CodeEditor")
+        self.code_editor.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
         self.code_editor.setPlaceholderText("Open a C source file from the workspace tree or File menu.")
         self.code_editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.code_editor.textChanged.connect(self._on_editor_text_changed)
+        self._code_highlighter = CFamilySyntaxHighlighter(self.code_editor.document())
+        self._code_highlighter.set_theme(self._theme_mode)
+        self._code_highlighter.set_language(self._editor_language_for_path(self._current_editor_file))
         layout.addWidget(self.code_editor, 1)
         return card
 
@@ -505,7 +740,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(QLabel("Output / Diagnostics", objectName="SectionLabel"))
         self.status_label = QLabel("Status: idle", objectName="StatusLabel")
         layout.addWidget(self.status_label)
-        self.log_output = QPlainTextEdit(objectName="LogOutput")
+        self.log_output = QTextEdit(objectName="LogOutput")
+        self.log_output.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
         self.log_output.setReadOnly(True)
         self.log_output.setPlaceholderText("Operation log and diagnostics appear here.")
         self.log_output.setMinimumHeight(120)
@@ -521,15 +757,27 @@ class MainWindow(QMainWindow):
         self.settings_toggle_btn = QPushButton()
         self._configure_footer_icon_button(self.settings_toggle_btn, self._settings_icon_path, "Settings", "⚙")
         self.settings_toggle_btn.clicked.connect(self._toggle_settings_panel)
-        self.footer_hint = QLabel("Ready", objectName="MutedLabel")
+
+        self.theme_switch = ThemeSwitch()
+        self.theme_switch.setObjectName("ThemeSwitch")
+        self.theme_switch.setToolTip("Toggle light and dark theme")
+        self.theme_switch.set_theme_mode(self._theme_mode)
+        self.theme_switch.setChecked(self._theme_mode == "dark")
+        self.theme_switch.toggled.connect(self._on_theme_switch_toggled)
+
+        self.theme_mode_label = QLabel("Dark" if self._theme_mode == "dark" else "Light", objectName="MutedLabel")
+        self.theme_mode_label.setMinimumWidth(self._scaled(40))
+
         self.notification_button = QPushButton()
         self._configure_footer_icon_button(self.notification_button, self._notification_icon_path, "Notifications", "🔔")
         self.notification_button.clicked.connect(self._toggle_notification_popup)
         self.zoom_button = QPushButton()
         self._configure_footer_icon_button(self.zoom_button, self._zoom_icon_path, "Zoom", "🔍")
         self.zoom_button.clicked.connect(self._toggle_zoom_popup)
+        
         layout.addWidget(self.settings_toggle_btn)
-        layout.addWidget(self.footer_hint)
+        layout.addWidget(self.theme_switch)
+        layout.addWidget(self.theme_mode_label)
         layout.addStretch(1)
         layout.addWidget(self.notification_button)
         layout.addWidget(self.zoom_button)
@@ -601,12 +849,6 @@ class MainWindow(QMainWindow):
                 font-size: 12px;
                 font-weight: 500;
             }
-            QLabel#LogoLabel {
-                color: #ffffff;
-                font-weight: 700;
-                min-width: 20px;
-                min-height: 20px;
-            }
             QFrame#Card {
                 background: #252526;
                 border: 1px solid #333333;
@@ -625,7 +867,7 @@ class MainWindow(QMainWindow):
                 color: #4fc1ff;
                 font-weight: 600;
             }
-            QLineEdit, QPlainTextEdit {
+            QLineEdit, QPlainTextEdit, QTextEdit {
                 background: #1f1f1f;
                 color: #d4d4d4;
                 border: 1px solid #3a3a3a;
@@ -633,16 +875,16 @@ class MainWindow(QMainWindow):
                 padding: 6px 8px;
                 selection-background-color: #264f78;
             }
-            QLineEdit:focus, QPlainTextEdit:focus {
+            QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus {
                 border: 1px solid #007acc;
             }
             QPlainTextEdit#CodeEditor {
-                font-family: Cascadia Code, Consolas, Courier New;
+                font-family: Consolas, Courier New, monospace;
                 font-size: 13px;
                 background: #1e1e1e;
             }
-            QPlainTextEdit#LogOutput {
-                font-family: Cascadia Code, Consolas, Courier New;
+            QTextEdit#LogOutput {
+                font-family: Consolas, Courier New, monospace;
                 font-size: 12px;
                 background: #181818;
             }
@@ -653,19 +895,23 @@ class MainWindow(QMainWindow):
                 border-radius: 6px;
                 padding: 6px 10px;
             }
-            QPushButton:hover, QToolButton:hover {
-                background: #37373d;
-            }
-            QPushButton:pressed, QToolButton:pressed {
-                background: #242428;
-            }
             QToolButton#TopMenuButton {
-                padding: 4px 8px;
+                background: #2d2d30;
+                color: #d4d4d4;
+                border: 1px solid #3c3c3c;
+                border-radius: 6px;
+                padding: 4px 10px;
                 min-height: 20px;
             }
             QToolButton#TopMenuButton::menu-indicator {
                 image: none;
                 width: 0px;
+            }
+            QPushButton:hover, QToolButton:hover {
+                background: #37373d;
+            }
+            QPushButton:pressed, QToolButton:pressed {
+                background: #242428;
             }
             QPushButton#PrimaryButton {
                 background: #0e639c;
@@ -684,10 +930,10 @@ class MainWindow(QMainWindow):
                 color: #d4d4d4;
                 border: 1px solid #3c3c3c;
                 border-radius: 5px;
-                min-width: 24px;
-                max-width: 24px;
-                min-height: 24px;
-                max-height: 24px;
+                min-width: 28px;
+                max-width: 28px;
+                min-height: 28px;
+                max-height: 28px;
                 padding: 0px;
                 font-size: 12px;
             }
@@ -751,6 +997,12 @@ class MainWindow(QMainWindow):
             QPushButton#NotificationPopupButton:pressed {
                 background: #242428;
             }
+            QCheckBox#ThemeSwitch {
+                background: transparent;
+                border: none;
+                padding: 0px;
+                margin: 0px;
+            }
             QTreeView {
                 background: #1f1f1f;
                 color: #d4d4d4;
@@ -760,6 +1012,25 @@ class MainWindow(QMainWindow):
             }
             QTreeView::item:selected {
                 background: #094771;
+                color: #ffffff;
+            }
+            QMenu {
+                background: #252526;
+                color: #d4d4d4;
+                border: 1px solid #3a3a3a;
+                border-radius: 4px;
+            }
+            QMenu::item:selected {
+                background: #094771;
+                color: #ffffff;
+            }
+            QMenu::item:disabled {
+                color: #5a5a5a;
+            }
+            QMenu::separator {
+                background: #3a3a3a;
+                height: 1px;
+                margin: 4px 0px;
             }
             QSplitter::handle {
                 background: #2a2a2a;
@@ -772,9 +1043,29 @@ class MainWindow(QMainWindow):
 
         app = QApplication.instance()
         if app is not None:
+            theme = self._theme_colors()
+            palette = app.palette()
+            palette.setColor(QPalette.ColorRole.Window, QColor(theme["window"]))
+            palette.setColor(QPalette.ColorRole.WindowText, QColor(theme["text"]))
+            palette.setColor(QPalette.ColorRole.Base, QColor(theme["base"]))
+            palette.setColor(QPalette.ColorRole.AlternateBase, QColor(theme["alternate_base"]))
+            palette.setColor(QPalette.ColorRole.Text, QColor(theme["text"]))
+            palette.setColor(QPalette.ColorRole.Button, QColor(theme["button"]))
+            palette.setColor(QPalette.ColorRole.ButtonText, QColor(theme["button_text"]))
+            palette.setColor(QPalette.ColorRole.Highlight, QColor(theme["highlight"]))
+            palette.setColor(QPalette.ColorRole.HighlightedText, QColor(theme["highlight_text"]))
+            palette.setColor(QPalette.ColorRole.ToolTipBase, QColor(theme["tooltip_base"]))
+            palette.setColor(QPalette.ColorRole.ToolTipText, QColor(theme["tooltip_text"]))
+            app.setPalette(palette)
+
             font = app.font()
             font.setPointSize(self._scaled(11))
             app.setFont(font)
+
+        if self._code_highlighter is not None:
+            self._code_highlighter.set_theme(self._theme_mode)
+        if hasattr(self, "_workspace_icon_provider"):
+            self._workspace_icon_provider.set_theme_mode(self._theme_mode)
 
         self.setStyleSheet(
             self.styleSheet()
@@ -788,10 +1079,6 @@ class MainWindow(QMainWindow):
             QLabel#TopBarTitle {
                 font-size: __TOP_TITLE_FONT__px;
             }
-            QLabel#LogoLabel {
-                min-width: __LOGO_SIZE__px;
-                min-height: __LOGO_SIZE__px;
-            }
             QFrame#Card {
                 border-radius: __CARD_RADIUS__px;
             }
@@ -801,29 +1088,25 @@ class MainWindow(QMainWindow):
             QLabel#MutedLabel {
                 font-size: __MUTED_FONT__px;
             }
-            QLineEdit, QPlainTextEdit {
+            QLineEdit, QPlainTextEdit, QTextEdit {
                 border-radius: __INPUT_RADIUS__px;
                 padding: __INPUT_PAD_Y__px __INPUT_PAD_X__px;
             }
             QPlainTextEdit#CodeEditor {
                 font-size: __CODE_FONT__px;
             }
-            QPlainTextEdit#LogOutput {
+            QTextEdit#LogOutput {
                 font-size: __LOG_FONT__px;
             }
             QPushButton, QToolButton {
                 padding: __BTN_PAD_Y__px __BTN_PAD_X__px;
             }
-            QToolButton#TopMenuButton {
-                padding: __TOP_BTN_PAD_Y__px __TOP_BTN_PAD_X__px;
-                min-height: __TOP_BTN_MIN_H__px;
-            }
             QPushButton#FooterIconButton {
                 border-radius: __FOOTER_RADIUS__px;
-                min-width: __FOOTER_SIZE__px;
-                max-width: __FOOTER_SIZE__px;
-                min-height: __FOOTER_SIZE__px;
-                max-height: __FOOTER_SIZE__px;
+                min-width: __FOOTER_SIZE_LARGE__px;
+                max-width: __FOOTER_SIZE_LARGE__px;
+                min-height: __FOOTER_SIZE_LARGE__px;
+                max-height: __FOOTER_SIZE_LARGE__px;
                 font-size: __FOOTER_FONT__px;
             }
             QTreeView {
@@ -836,7 +1119,6 @@ class MainWindow(QMainWindow):
             """
             .replace("__ROOT_FONT__", str(self._scaled(12)))
             .replace("__TOP_TITLE_FONT__", str(self._scaled(11)))
-            .replace("__LOGO_SIZE__", str(self._scaled(18)))
             .replace("__CARD_RADIUS__", str(self._scaled(7)))
             .replace("__SECTION_FONT__", str(self._scaled(11)))
             .replace("__MUTED_FONT__", str(self._scaled(11)))
@@ -847,21 +1129,32 @@ class MainWindow(QMainWindow):
             .replace("__LOG_FONT__", str(self._scaled(11)))
             .replace("__BTN_PAD_Y__", str(self._scaled(5)))
             .replace("__BTN_PAD_X__", str(self._scaled(8)))
-            .replace("__TOP_BTN_PAD_Y__", str(self._scaled(3)))
-            .replace("__TOP_BTN_PAD_X__", str(self._scaled(7)))
-            .replace("__TOP_BTN_MIN_H__", str(self._scaled(18)))
             .replace("__FOOTER_RADIUS__", str(self._scaled(4)))
             .replace("__FOOTER_SIZE__", str(self._scaled(24)))
+            .replace("__FOOTER_SIZE_LARGE__", str(self._scaled(28)))
             .replace("__FOOTER_FONT__", str(self._scaled(12)))
             .replace("__TREE_RADIUS__", str(self._scaled(5)))
             .replace("__TREE_PAD__", str(self._scaled(3)))
             .replace("__SPLIT_HANDLE_W__", str(self._scaled(2)))
         )
 
+        if self._theme_mode == "light":
+            stylesheet = self.styleSheet()
+            for old_str, new_str in self._light_theme_overrides().items():
+                stylesheet = stylesheet.replace(old_str, new_str)
+            self.setStyleSheet(stylesheet)
+
     def _apply_settings_to_form(self) -> None:
-        self.dosbox_input.setText(self._settings.dosbox_exe)
         self.turbo_input.setText(self._settings.turboc_root)
         self.project_input.setText(self._settings.project_root)
+        self._refresh_dosbox_path_from_settings()
+        self.fullscreen_output_checkbox.setChecked(self._settings.show_output_in_fullscreen)
+        self.theme_switch.blockSignals(True)
+        self.theme_switch.setChecked(self._theme_mode == "dark")
+        self.theme_switch.blockSignals(False)
+        self._update_theme_switch_label()
+        self._apply_output_panel_visibility()
+        self._update_zoom_popup()
 
     def _restore_window_geometry(self) -> None:
         encoded_geometry = self._settings.window_geometry.strip()
@@ -887,10 +1180,11 @@ class MainWindow(QMainWindow):
             self._settings.window_display_mode = "normal"
         self._storage.save(self._settings)
 
-    def _set_workspace_root(self, path: Path) -> None:
+    def _set_workspace_root(self, path: Path, *, sync_project_input: bool = True) -> None:
         workspace = path if path.exists() else Path.cwd()
         self._workspace_root = workspace.resolve()
-        self.project_input.setText(str(self._workspace_root))
+        if sync_project_input:
+            self.project_input.setText(str(self._workspace_root))
         self.workspace_root_label.setText(str(self._workspace_root))
         root_index = self.workspace_model.index(str(self._workspace_root))
         self.workspace_tree.setRootIndex(root_index)
@@ -898,8 +1192,61 @@ class MainWindow(QMainWindow):
         self._refresh_action_states()
 
     def _toggle_settings_panel(self) -> None:
-        self.settings_panel.setVisible(not self.settings_panel.isVisible())
-        self.footer_hint.setText("Settings open" if self.settings_panel.isVisible() else "Ready")
+        if self.settings_dialog.isVisible():
+            self.settings_dialog.close()
+            return
+
+        self._apply_settings_to_form()
+        self._position_settings_dialog()
+        self.settings_dialog.show()
+        self.settings_dialog.raise_()
+        self.settings_dialog.activateWindow()
+        self._update_status("Settings open")
+
+    def _position_settings_dialog(self) -> None:
+        self.settings_dialog.adjustSize()
+        anchor = self.settings_toggle_btn.mapToGlobal(QPoint(0, self.settings_toggle_btn.height()))
+        screen = QApplication.screenAt(anchor) or QApplication.primaryScreen()
+        if screen is None:
+            self.settings_dialog.move(anchor)
+            return
+
+        available = screen.availableGeometry()
+        x = anchor.x()
+        y = anchor.y() + self._scaled(8)
+
+        if x + self.settings_dialog.width() > available.right():
+            x = max(available.left(), available.right() - self.settings_dialog.width())
+        if y + self.settings_dialog.height() > available.bottom():
+            y = max(available.top(), anchor.y() - self.settings_dialog.height() - self._scaled(8))
+
+        x = max(available.left(), x)
+        y = max(available.top(), y)
+        self.settings_dialog.move(x, y)
+
+    def _on_settings_dialog_closed(self, _result: int) -> None:
+        if self._is_valid_directory(self._settings.turboc_root) and self._is_valid_directory(self._settings.project_root):
+            self._update_status("Ready")
+        else:
+            self._update_status("Settings incomplete")
+
+    def _normalize_theme_mode(self, theme_mode: object) -> str:
+        mode = str(theme_mode).lower()
+        return mode if mode in {"light", "dark"} else "light"
+
+    def _update_theme_switch_label(self) -> None:
+        if hasattr(self, "theme_mode_label"):
+            self.theme_mode_label.setText("Dark" if self._theme_mode == "dark" else "Light")
+        if hasattr(self, "theme_switch"):
+            self.theme_switch.set_theme_mode(self._theme_mode)
+            self.theme_switch.updateGeometry()
+
+    def _on_theme_switch_toggled(self, checked: bool) -> None:
+        self._theme_mode = "dark" if checked else "light"
+        self._settings.theme_mode = self._theme_mode
+        self._update_theme_switch_label()
+        self._apply_theme()
+        self._storage.save(self._settings)
 
     def _scaled(self, value: int) -> int:
         return max(1, round(value * self._ui_scale))
@@ -915,10 +1262,74 @@ class MainWindow(QMainWindow):
         self._update_footer_icon_sizes()
         self._update_zoom_popup()
         self._refresh_view_actions()
+        self._update_theme_switch_label()
+        self._update_editor_file_label()
 
     def _set_zoom_level(self, level: int) -> None:
         self._zoom_level = max(self._zoom_min_level, min(self._zoom_max_level, level))
         self._apply_zoom()
+        self._settings.zoom_level = self._zoom_level
+        self._storage.save(self._settings)
+
+    def _light_theme_overrides(self) -> dict[str, str]:
+        return {
+            "QFrame#TopBar {\n                background: #252526;\n                border: 1px solid #333333;\n                border-radius: 8px;\n            }": "QFrame#TopBar {\n                background: #ffffff;\n                border: 1px solid #d0d7de;\n                border-radius: 8px;\n            }",
+            "QToolButton#TopMenuButton {\n                background: #2d2d30;\n                color: #d4d4d4;\n                border: 1px solid #3c3c3c;\n                border-radius: 6px;\n                padding: 4px 10px;\n                min-height: 20px;\n            }": "QToolButton#TopMenuButton {\n                background: #f3f4f6;\n                color: #1f2328;\n                border: 1px solid #d0d7de;\n                border-radius: 6px;\n                padding: 4px 10px;\n                min-height: 20px;\n            }",
+            "QToolButton#TopMenuButton:hover {\n                background: #37373d;\n            }": "QToolButton#TopMenuButton:hover {\n                background: #e5e7eb;\n            }",
+            "QToolButton#TopMenuButton:pressed {\n                background: #242428;\n            }": "QToolButton#TopMenuButton:pressed {\n                background: #dbe3ea;\n            }",
+            "QTreeView::item:selected {\n                background: #094771;\n                color: #ffffff;\n            }": "QTreeView::item:selected {\n                background: #dbeeff;\n                color: #1f2328;\n            }",
+            "QMenu::item:selected {\n                background: #094771;\n                color: #ffffff;\n            }": "QMenu::item:selected {\n                background: #cfe9ff;\n                color: #1f2328;\n            }",
+            "#1e1e1e": "#f5f7fb",
+            "#252526": "#ffffff",
+            "#333333": "#d0d7de",
+            "#c8c8c8": "#4b5563",
+            "#c5c5c5": "#374151",
+            "#d4d4d4": "#1f2328",
+            "#8f959e": "#667085",
+            "#1f1f1f": "#ffffff",
+            "#3a3a3a": "#c9d1d9",
+            "#181818": "#fbfcfe",
+            "#2d2d30": "#f3f4f6",
+            "#3c3c3c": "#c9d1d9",
+            "#37373d": "#e5e7eb",
+            "#242428": "#d8dde3",
+            "#4fc1ff": "#0e639c",
+            "#094771": "#dbeeff",
+            "#2a2a2a": "#d7dbe0",
+            "#4b4b4b": "#cfd6df",
+            "#5a5a5a": "#b6c1cc",
+        }
+
+    def _theme_colors(self) -> dict[str, str]:
+        if self._theme_mode == "dark":
+            return {
+                "window": "#1e1e1e",
+                "text": "#d4d4d4",
+                "base": "#1f1f1f",
+                "alternate_base": "#252526",
+                "button": "#2d2d30",
+                "button_text": "#d4d4d4",
+                "error": "#ff6b6b",
+                "warning": "#f1c40f",
+                "highlight": "#094771",
+                "highlight_text": "#ffffff",
+                "tooltip_base": "#252526",
+                "tooltip_text": "#d4d4d4",
+            }
+        return {
+            "window": "#f5f7fb",
+            "text": "#1f2328",
+            "base": "#ffffff",
+            "alternate_base": "#ffffff",
+            "button": "#f3f4f6",
+            "button_text": "#1f2328",
+            "error": "#c62828",
+            "warning": "#b58900",
+            "highlight": "#0e639c",
+            "highlight_text": "#ffffff",
+            "tooltip_base": "#ffffff",
+            "tooltip_text": "#1f2328",
+        }
 
     def _zoom_in(self) -> None:
         self._set_zoom_level(self._zoom_level + 1)
@@ -938,10 +1349,10 @@ class MainWindow(QMainWindow):
             button.setIcon(QIcon(str(icon_path)))
         else:
             button.setText(fallback_text)
-        button.setIconSize(QSize(self._scaled(16), self._scaled(16)))
+        button.setIconSize(QSize(self._scaled(18), self._scaled(18)))
 
     def _update_footer_icon_sizes(self) -> None:
-        icon_size = QSize(self._scaled(16), self._scaled(16))
+        icon_size = QSize(self._scaled(18), self._scaled(18))
         if hasattr(self, "settings_toggle_btn"):
             self.settings_toggle_btn.setIconSize(icon_size)
         if hasattr(self, "notification_button"):
@@ -1005,13 +1416,15 @@ class MainWindow(QMainWindow):
             self._fullscreen_restore_mode = "maximized" if self.isMaximized() else "normal"
             self.showFullScreen()
         self._refresh_view_actions()
+        self._apply_output_panel_visibility()
 
     def _toggle_explorer_sidebar(self) -> None:
         self.sidebar_widget.setVisible(self.act_toggle_explorer_sidebar.isChecked())
         self._refresh_view_actions()
 
     def _toggle_output_panel(self) -> None:
-        self.output_card.setVisible(self.act_toggle_output_panel.isChecked())
+        self._output_panel_visible = self.act_toggle_output_panel.isChecked()
+        self._apply_output_panel_visibility()
         self._refresh_view_actions()
 
     def _refresh_source_display(self) -> None:
@@ -1022,32 +1435,76 @@ class MainWindow(QMainWindow):
         else:
             self.source_info_label.setText(f"Selected source: {source}")
             self.executable_info_label.setText(f"Executable: {source.with_suffix('.EXE').name}")
-        editor_label = f"Editor file: {self._current_editor_file if self._current_editor_file else 'none'}"
-        if self._editor_dirty:
-            editor_label += " *"
-        self.editor_file_label.setText(editor_label)
+        self._update_editor_file_label()
         self._refresh_action_states()
+
+    def _update_editor_file_label(self) -> None:
+        prefix = "Editor file: "
+        if self._current_editor_file is None:
+            text = f"{prefix}none"
+            self.editor_file_label.setText(text)
+            self.editor_file_label.setToolTip(text)
+            return
+
+        full_path = str(self._current_editor_file)
+        dirty_suffix = " *" if self._editor_dirty else ""
+        ellipsis_delta = max(
+            0,
+            self.editor_file_label.fontMetrics().horizontalAdvance("...")
+            - self.editor_file_label.fontMetrics().horizontalAdvance("…"),
+        )
+        available_width = max(
+            1,
+            self.editor_file_label.contentsRect().width()
+            - self.editor_file_label.fontMetrics().horizontalAdvance(prefix)
+            - self.editor_file_label.fontMetrics().horizontalAdvance(dirty_suffix),
+        )
+        available_width = max(1, available_width - ellipsis_delta)
+        elided_path = self.editor_file_label.fontMetrics().elidedText(
+            full_path,
+            Qt.TextElideMode.ElideMiddle,
+            available_width,
+        ).replace("…", "...")
+        text = f"{prefix}{elided_path}{dirty_suffix}"
+        self.editor_file_label.setText(text)
+        self.editor_file_label.setToolTip(f"{prefix}{full_path}{dirty_suffix}")
 
     def _refresh_action_states(self) -> None:
         has_source = self._current_source_file() is not None
         has_editor = self._current_editor_file is not None
         self.act_save.setEnabled(has_editor or self._editor_dirty)
+        if hasattr(self, "save_file_btn"):
+            self.save_file_btn.setEnabled(has_editor or self._editor_dirty)
+        if hasattr(self, "save_as_btn"):
+            self.save_as_btn.setEnabled(True)
         self.act_revert_file.setEnabled(has_editor)
         self.act_close_editor.setEnabled(has_editor or bool(self.code_editor.toPlainText()))
         self.act_compile.setEnabled(has_source)
         self.act_run.setEnabled(has_source)
-        self.act_start_turboc.setEnabled(bool(self._settings.dosbox_exe and self._settings.turboc_root and self._settings.project_root))
+        if hasattr(self, "compile_btn"):
+            self.compile_btn.setEnabled(has_source)
+        if hasattr(self, "run_btn"):
+            self.run_btn.setEnabled(has_source)
+        self.act_start_turboc.setEnabled(bool(
+            self._is_valid_directory(self._settings.turboc_root)
+            and self._is_valid_directory(self._settings.project_root)
+            and resolve_dosbox_executable_path(self._settings.dosbox_exe, self._settings.turboc_root)
+        ))
         self.act_stop_session.setEnabled(True)
 
     def _refresh_view_actions(self) -> None:
         self.act_toggle_full_screen.setChecked(self.isFullScreen())
         self.act_toggle_explorer_sidebar.setChecked(self.sidebar_widget.isVisible())
-        self.act_toggle_output_panel.setChecked(self.output_card.isVisible())
+        self.act_toggle_output_panel.setChecked(self._output_panel_visible)
+
+    def _apply_output_panel_visibility(self) -> None:
+        should_show = self._output_panel_visible and (not self.isFullScreen() or self._settings.show_output_in_fullscreen)
+        self.output_card.setVisible(should_show)
 
     def _current_source_file(self) -> Path | None:
         if self._selected_source_file is not None and self._selected_source_file.exists():
             return self._selected_source_file
-        if self._current_editor_file is not None and self._current_editor_file.suffix.lower() == ".c":
+        if self._current_editor_file is not None and self._is_source_file(self._current_editor_file):
             return self._current_editor_file
         return None
 
@@ -1065,7 +1522,7 @@ class MainWindow(QMainWindow):
 
     def _on_workspace_clicked(self, index) -> None:
         path = Path(self.workspace_model.filePath(index))
-        if path.is_file() and path.suffix.lower() == ".c":
+        if self._is_source_file(path):
             if not self._flush_pending_auto_save():
                 return
             self._load_editor_file(path)
@@ -1077,7 +1534,7 @@ class MainWindow(QMainWindow):
             if not self._flush_pending_auto_save():
                 return
             self._load_editor_file(path)
-            if path.suffix.lower() == ".c":
+            if self._is_source_file(path):
                 self._selected_source_file = path.resolve()
             self._refresh_source_display()
 
@@ -1093,8 +1550,9 @@ class MainWindow(QMainWindow):
         self._updating_editor_programmatically = False
         self._current_editor_file = file_path.resolve()
         self._editor_dirty = False
-        if file_path.suffix.lower() == ".c":
+        if self._is_source_file(file_path):
             self._selected_source_file = self._current_editor_file
+        self._refresh_editor_highlighter()
         return True
 
     def _write_editor_file(self, file_path: Path, *, announce: bool = True) -> bool:
@@ -1106,8 +1564,9 @@ class MainWindow(QMainWindow):
             return False
         self._current_editor_file = file_path.resolve()
         self._editor_dirty = False
-        if file_path.suffix.lower() == ".c":
+        if self._is_source_file(file_path):
             self._selected_source_file = self._current_editor_file
+        self._refresh_editor_highlighter()
         self._refresh_source_display()
         return True
 
@@ -1169,6 +1628,7 @@ class MainWindow(QMainWindow):
         self._current_editor_file = None
         self._selected_source_file = None
         self._editor_dirty = False
+        self._refresh_editor_highlighter()
         self._refresh_source_display()
 
     def _on_open_file(self) -> None:
@@ -1193,6 +1653,251 @@ class MainWindow(QMainWindow):
         selected = QFileDialog.getExistingDirectory(self, "Select Workspace Folder", str(self._workspace_root))
         if selected:
             self._set_workspace_root(Path(selected))
+
+    def _current_workspace_directory(self) -> Path:
+        current_index = self.workspace_tree.currentIndex()
+        if current_index.isValid():
+            current_path = Path(self.workspace_model.filePath(current_index))
+            if current_path.is_dir():
+                return current_path
+            if current_path.is_file():
+                return current_path.parent
+        return self._workspace_root if self._workspace_root.exists() else Path.cwd()
+
+    def _is_source_file(self, file_path: Path | None) -> bool:
+        """Check if file is a compilable source file (C or C++)"""
+        if file_path is None:
+            return False
+        suffix = file_path.suffix.lower()
+        return suffix in {".c", ".cpp", ".cxx", ".cc", ".c++"}
+
+    def _editor_language_for_path(self, file_path: Path | None) -> str:
+        if file_path is None:
+            return "c"
+
+        suffix = file_path.suffix.lower()
+        if suffix in {".cpp", ".cxx", ".cc", ".hpp", ".hh", ".hxx", ".ipp", ".inl", ".tpp", ".h"}:
+            return "cpp"
+        if suffix == ".cs":
+            return "csharp"
+        return "c"
+
+    def _refresh_editor_highlighter(self) -> None:
+        if self._code_highlighter is None:
+            return
+        self._code_highlighter.set_language(self._editor_language_for_path(self._current_editor_file))
+
+    def _workspace_path_from_index(self, index) -> Path | None:
+        if not index.isValid():
+            return None
+        path = Path(self.workspace_model.filePath(index))
+        if not path.exists():
+            return None
+        return path
+
+    def _show_workspace_context_menu(self, position: QPoint) -> None:
+        index = self.workspace_tree.indexAt(position)
+        path = self._workspace_path_from_index(index)
+        if path is None:
+            return
+
+        self.workspace_tree.setCurrentIndex(index)
+
+        menu = QMenu(self)
+        run_action = menu.addAction("Run code")
+        run_action.setEnabled(self._is_source_file(path))
+        menu.addSeparator()
+        cut_action = menu.addAction("Cut")
+        copy_action = menu.addAction("Copy")
+        rename_action = menu.addAction("Rename")
+        delete_action = menu.addAction("Delete")
+        menu.addSeparator()
+        reveal_action = menu.addAction("Reveal in File Explorer")
+        copy_path_action = menu.addAction("Copy Path")
+        copy_relative_path_action = menu.addAction("Copy Relative Path")
+
+        selected_action = menu.exec(self.workspace_tree.viewport().mapToGlobal(position))
+        if selected_action is None:
+            return
+        if selected_action == run_action:
+            self._run_workspace_file(path)
+        elif selected_action == cut_action:
+            self._copy_workspace_reference(path, action_label="Cut")
+        elif selected_action == copy_action:
+            self._copy_workspace_reference(path, action_label="Copy")
+        elif selected_action == rename_action:
+            self._rename_workspace_item(path)
+        elif selected_action == delete_action:
+            self._delete_workspace_item(path)
+        elif selected_action == reveal_action:
+            self._reveal_workspace_item(path)
+        elif selected_action == copy_path_action:
+            self._copy_path_to_clipboard(path, relative=False)
+        elif selected_action == copy_relative_path_action:
+            self._copy_path_to_clipboard(path, relative=True)
+
+    def _run_workspace_file(self, path: Path) -> None:
+        if not self._is_source_file(path):
+            self._show_error("Run code", "Run code is only available for C and C++ source files.")
+            return
+
+        if not self._flush_pending_auto_save():
+            return
+
+        self._selected_source_file = path.resolve()
+        self._refresh_source_display()
+        self._on_run()
+
+    def _copy_workspace_reference(self, path: Path, *, action_label: str) -> None:
+        clipboard = QApplication.clipboard()
+        mime_data = QMimeData()
+        resolved_path = path.resolve()
+        mime_data.setUrls([QUrl.fromLocalFile(str(resolved_path))])
+        mime_data.setText(str(resolved_path))
+        clipboard.setMimeData(mime_data)
+        self._update_status(f"{action_label}: {resolved_path.name}")
+        self._append_log(f"{action_label}: {resolved_path}")
+
+    def _copy_text_to_clipboard(self, text: str) -> None:
+        QApplication.clipboard().setText(text)
+
+    def _copy_path_to_clipboard(self, path: Path, *, relative: bool) -> None:
+        resolved_path = path.resolve()
+        if relative:
+            try:
+                text = os.path.relpath(str(resolved_path), str(self._workspace_root.resolve()))
+            except ValueError:
+                text = str(resolved_path)
+        else:
+            text = str(resolved_path)
+        self._copy_text_to_clipboard(text)
+        self._update_status(f"Copied path: {text}")
+
+    def _rename_workspace_item(self, path: Path) -> None:
+        if not self._flush_pending_auto_save():
+            return
+
+        new_name, ok = QInputDialog.getText(
+            self,
+            "Rename",
+            "New name:",
+            text=path.name,
+        )
+        if not ok:
+            return
+
+        new_name = new_name.strip()
+        if not new_name:
+            self._show_error("Rename failed", "Name cannot be empty.")
+            return
+
+        new_path = path.with_name(new_name)
+        if new_path.exists():
+            self._show_error("Rename failed", f"A file or folder already exists at: {new_path}")
+            return
+
+        try:
+            path.rename(new_path)
+        except OSError as exc:
+            self._show_error("Rename failed", f"Unable to rename item: {exc}")
+            return
+
+        if self._current_editor_file is not None and self._current_editor_file.resolve() == path.resolve():
+            self._current_editor_file = new_path.resolve()
+        if self._selected_source_file is not None and self._selected_source_file.resolve() == path.resolve():
+            self._selected_source_file = new_path.resolve() if new_path.suffix.lower() == ".c" else None
+        self._refresh_editor_highlighter()
+        self.workspace_tree.setCurrentIndex(self.workspace_model.index(str(new_path)))
+        self._refresh_source_display()
+        self._update_status(f"Renamed: {path.name} -> {new_path.name}")
+
+    def _delete_workspace_item(self, path: Path) -> None:
+        if not self._flush_pending_auto_save():
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Delete",
+            f"Move '{path.name}' to the recycle bin?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        if not QFile.moveToTrash(str(path.resolve())):
+            self._show_error("Delete failed", f"Unable to move to the recycle bin: {path}")
+            return
+
+        if self._current_editor_file is not None and self._current_editor_file.resolve() == path.resolve():
+            self._auto_save_timer.stop()
+            self._updating_editor_programmatically = True
+            self.code_editor.clear()
+            self._updating_editor_programmatically = False
+            self._current_editor_file = None
+            self._editor_dirty = False
+        if self._selected_source_file is not None and self._selected_source_file.resolve() == path.resolve():
+            self._selected_source_file = None
+
+        parent_index = self.workspace_model.index(str(path.parent))
+        if parent_index.isValid():
+            self.workspace_tree.setCurrentIndex(parent_index)
+        self._refresh_source_display()
+        self._update_status(f"Moved to recycle bin: {path.name}")
+
+    def _reveal_workspace_item(self, path: Path) -> None:
+        resolved_path = path.resolve()
+        try:
+            if os.name == "nt":
+                if resolved_path.is_file():
+                    subprocess.Popen(["explorer.exe", "/select,", str(resolved_path)])
+                else:
+                    subprocess.Popen(["explorer.exe", str(resolved_path)])
+                self._update_status(f"Revealed: {resolved_path.name}")
+                self._append_log(f"Revealed: {resolved_path}")
+                return
+        except OSError:
+            pass
+
+        fallback_target = resolved_path if resolved_path.is_dir() else resolved_path.parent
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(fallback_target)))
+        self._update_status(f"Revealed: {resolved_path.name}")
+        self._append_log(f"Revealed: {resolved_path}")
+
+    def _on_create_workspace_folder(self) -> None:
+        if not self._flush_pending_auto_save():
+            return
+
+        target_directory = self._current_workspace_directory()
+        folder_name, ok = QInputDialog.getText(
+            self,
+            "Create Folder",
+            "Folder name:",
+            text="New Folder",
+        )
+        if not ok:
+            return
+
+        folder_name = folder_name.strip()
+        if not folder_name:
+            self._show_error("Create folder failed", "Folder name cannot be empty.")
+            return
+
+        new_folder_path = target_directory / folder_name
+        try:
+            new_folder_path.mkdir(parents=False, exist_ok=False)
+        except FileExistsError:
+            self._show_error("Create folder failed", f"Folder already exists: {new_folder_path}")
+            return
+        except OSError as exc:
+            self._show_error("Create folder failed", f"Unable to create folder: {exc}")
+            return
+
+        parent_index = self.workspace_model.index(str(target_directory))
+        self.workspace_tree.expand(parent_index)
+        self.workspace_tree.setCurrentIndex(self.workspace_model.index(str(new_folder_path)))
+        self._update_status(f"Created folder: {new_folder_path}")
+        self._append_log(f"Created folder: {new_folder_path}")
 
     def _on_save_file(self) -> None:
         if self._current_editor_file is None:
@@ -1225,13 +1930,20 @@ class MainWindow(QMainWindow):
         self._current_editor_file = None
         self._selected_source_file = None
         self._editor_dirty = False
+        self._refresh_editor_highlighter()
         self._refresh_source_display()
 
     def _collect_settings(self) -> AppSettings:
+        turbo_root = self.turbo_input.text().strip()
+        project_root = self.project_input.text().strip()
+        resolved_dosbox = resolve_dosbox_executable_path("", turbo_root)
         return AppSettings(
-            dosbox_exe=self.dosbox_input.text().strip(),
-            turboc_root=self.turbo_input.text().strip(),
-            project_root=self.project_input.text().strip(),
+            dosbox_exe=str(resolved_dosbox) if resolved_dosbox is not None else "",
+            turboc_root=turbo_root,
+            project_root=project_root,
+            show_output_in_fullscreen=self.fullscreen_output_checkbox.isChecked(),
+            zoom_level=self._zoom_level,
+            theme_mode=self._theme_mode,
         )
 
     def _on_save_settings(self) -> None:
@@ -1243,6 +1955,11 @@ class MainWindow(QMainWindow):
         self._storage.save(settings)
         self._settings = settings
         self._set_workspace_root(Path(settings.project_root))
+        self._refresh_dosbox_path_from_settings()
+        self._apply_output_panel_visibility()
+        self._refresh_view_actions()
+        if hasattr(self, "settings_dialog") and self.settings_dialog.isVisible():
+            self.settings_dialog.close()
 
     def _ensure_valid_settings(self) -> bool:
         settings = self._collect_settings()
@@ -1251,6 +1968,9 @@ class MainWindow(QMainWindow):
             self._show_error("Invalid settings", "\n".join(errors))
             return False
         self._settings = settings
+        self._refresh_dosbox_path_from_settings()
+        self._apply_output_panel_visibility()
+        self._refresh_view_actions()
         return True
 
     def _on_start(self) -> None:
@@ -1279,6 +1999,13 @@ class MainWindow(QMainWindow):
             return None
         return source
 
+    def _source_argument_for_build(self, source: Path) -> str:
+        project_root = Path(self._settings.project_root).resolve()
+        try:
+            return str(source.resolve().relative_to(project_root))
+        except ValueError:
+            return source.name
+
     def _on_compile(self) -> None:
         if not self._ensure_valid_settings():
             return
@@ -1289,11 +2016,7 @@ class MainWindow(QMainWindow):
         if source is None:
             return False, None
 
-        project_root = Path(self._settings.project_root).resolve()
-        try:
-            source_argument = source.resolve().relative_to(project_root)
-        except ValueError:
-            source_argument = source.name
+        source_argument = self._source_argument_for_build(source)
 
         result, diagnostics = self._turbo_service.compile(
             self._settings.dosbox_exe,
@@ -1314,7 +2037,8 @@ class MainWindow(QMainWindow):
         else:
             self._update_status("Compile succeeded")
 
-        self._append_log("Compile output:\n" + (diagnostics or result.output or "(no output)"))
+        self._append_log("Compile output:")
+        self._append_log(diagnostics or result.output or "(no output)")
 
         compile_ok = result.ok and error_count == 0
         return compile_ok, source
@@ -1324,13 +2048,14 @@ class MainWindow(QMainWindow):
             return
         compile_ok, source = self._compile_current_source()
         if not compile_ok or source is None:
-            self._append_log("Run canceled because compile did not succeed.")
+            self._append_log("Run canceled because compile did not succeed.", color="#ff6b6b")
             return
+        source_argument = self._source_argument_for_build(source)
         result = self._turbo_service.run_program(
             self._settings.dosbox_exe,
             self._settings.turboc_root,
             self._settings.project_root,
-            source.with_suffix(".EXE").name,
+            source_argument,
         )
         self._update_status("Run succeeded" if result.ok else "Run failed")
         self._append_log("Run output:\n" + (result.output or "(no output)"))
@@ -1342,19 +2067,173 @@ class MainWindow(QMainWindow):
             "Select a workspace folder, open a .C file from the explorer, then compile or run it.",
         )
 
-    def _show_about(self) -> None:
-        QMessageBox.information(
-            self,
-            "About",
-            "Editor for Turbo C by Nathan Lobo\nModern wrapper for Turbo C running in DOSBox.",
-        )
+    def _open_support_page(self) -> None:
+        QDesktopServices.openUrl(QUrl(self._codinx_support_url))
 
-    def _append_log(self, text: str) -> None:
-        self.log_output.appendPlainText(text)
+    def _show_about(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("About")
+        dialog.setWindowIcon(self.windowIcon())
+        dialog.setModal(True)
+        dialog.setMinimumWidth(self._scaled(560))
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        hero = QFrame(objectName="Card")
+        hero_layout = QHBoxLayout(hero)
+        hero_layout.setContentsMargins(16, 16, 16, 16)
+        hero_layout.setSpacing(14)
+
+        logo = QLabel()
+        logo.setFixedSize(self._scaled(72), self._scaled(72))
+        logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        logo.setStyleSheet(
+            """
+            QLabel {
+                border-radius: 18px;
+                background: #0e639c;
+                color: #ffffff;
+                font-size: 28px;
+                font-weight: 700;
+            }
+            """
+        )
+        if self._logo_path.exists():
+            pixmap = QPixmap(str(self._logo_path)).scaled(
+                self._scaled(64),
+                self._scaled(64),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            logo.setPixmap(pixmap)
+            logo.setStyleSheet("QLabel { background: transparent; }")
+        else:
+            logo.setText("TC")
+
+        hero_layout.addWidget(logo)
+
+        text_column = QVBoxLayout()
+        text_column.setSpacing(4)
+
+        title_label = QLabel("Turbo C Editor By Nathan Lobo")
+        title_label.setWordWrap(True)
+        title_label.setStyleSheet("font-size: 18px; font-weight: 700;")
+
+        version_label = QLabel(f"Version {self._about_version}", objectName="StatusLabel")
+
+        ownership_label = QLabel(
+            "&copy; 2026 by Codinx. All rights reserved.<br>Codinx is owned by Nathan Francisco Lobo."
+        )
+        ownership_label.setWordWrap(True)
+        ownership_label.setTextFormat(Qt.TextFormat.RichText)
+
+        website_label = QLabel(
+            f'<a href="{self._codinx_site_url}">{self._codinx_site_url}</a>'
+        )
+        website_label.setTextFormat(Qt.TextFormat.RichText)
+        website_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        website_label.setOpenExternalLinks(True)
+
+        text_column.addWidget(title_label)
+        text_column.addWidget(version_label)
+        text_column.addWidget(ownership_label)
+        text_column.addWidget(website_label)
+        text_column.addStretch(1)
+        hero_layout.addLayout(text_column, 1)
+        layout.addWidget(hero)
+
+        social_card = QFrame(objectName="Card")
+        social_layout = QVBoxLayout(social_card)
+        social_layout.setContentsMargins(16, 14, 16, 14)
+        social_layout.setSpacing(10)
+
+        social_title = QLabel("Connect", objectName="SectionLabel")
+        social_layout.addWidget(social_title)
+
+        social_row = QHBoxLayout()
+        social_row.setSpacing(8)
+        social_buttons = [
+            ("GitHub", "G", "#24292e", self._about_social_links["GitHub"]),
+            ("Email", "E", "#0e639c", self._about_social_links["Email"]),
+            ("WhatsApp", "W", "#25d366", self._about_social_links["WhatsApp"]),
+        ]
+        for label, badge, color, url in social_buttons:
+            button = QToolButton()
+            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+            button.setText(label)
+            button.setIcon(self._badge_icon(badge, color))
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.clicked.connect(lambda _checked=False, target=url: QDesktopServices.openUrl(QUrl(target)))
+            social_row.addWidget(button)
+        social_row.addStretch(1)
+        social_layout.addLayout(social_row)
+        layout.addWidget(social_card)
+
+        close_row = QHBoxLayout()
+        close_row.addStretch(1)
+        close_button = QPushButton("Close")
+        close_button.setObjectName("PrimaryButton")
+        close_button.clicked.connect(dialog.accept)
+        close_row.addWidget(close_button)
+        layout.addLayout(close_row)
+
+        dialog.exec()
+
+    def _badge_icon(self, letter: str, color: str) -> QIcon:
+        size = self._scaled(22)
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(color))
+        painter.drawEllipse(QRectF(0, 0, size, size))
+
+        font = painter.font()
+        font.setBold(True)
+        font.setPointSize(max(8, self._scaled(10)))
+        painter.setFont(font)
+        painter.setPen(QColor("#ffffff"))
+        painter.drawText(QRectF(0, 0, size, size), Qt.AlignmentFlag.AlignCenter, letter)
+        painter.end()
+        return QIcon(pixmap)
+
+    def _log_color_for_line(self, line: str) -> QColor:
+        theme_colors = self._theme_colors()
+        lower = line.lower()
+        if line.startswith("[ERROR]") or lower.startswith("error:") or " error" in lower:
+            return QColor(theme_colors["error"])
+        if line.startswith("[WARNING]") or "warning" in lower:
+            return QColor(theme_colors["warning"])
+        return QColor(theme_colors["text"])
+
+    def _append_log(self, text: str, color: str | None = None) -> None:
+        if not text:
+            return
+
+        lines = text.splitlines() or [text]
+        cursor = self.log_output.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.log_output.setTextCursor(cursor)
+
+        if color is not None:
+            line_color = QColor(color)
+            for line in lines:
+                self.log_output.setTextColor(line_color)
+                self.log_output.insertPlainText(line + "\n")
+        else:
+            for line in lines:
+                self.log_output.setTextColor(self._log_color_for_line(line))
+                self.log_output.insertPlainText(line + "\n")
+
+        self.log_output.setTextColor(QColor(self._theme_colors()["text"]))
+        self.log_output.ensureCursorVisible()
 
     def _update_status(self, status: str) -> None:
         self.status_label.setText(f"Status: {status}")
-        self.footer_hint.setText(status if status else "Ready")
 
     def _show_error(self, title: str, message: str) -> None:
         QMessageBox.critical(self, title, message)

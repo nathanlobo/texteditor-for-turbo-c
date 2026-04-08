@@ -1,0 +1,23 @@
+# Python cache and virtual environments
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+
+# Generated packaging assets and previews
+src/app/assets/icon.ico
+_c_icon_preview.png
+_cpp_icon_preview.png
+
+# Local run logs
+stdout.txt
+stderr.txt
