@@ -219,18 +219,24 @@ class MainWindow(QMainWindow):
 
         self._dosbox_service = DosBoxService()
         self._turbo_service = TurboCService(self._dosbox_service)
+        self._recent_logo_path = asset_path("dos-codinx.ico")
         self._logo_path = asset_path("icon.png")
         self._settings_icon_path = asset_path("settings.svg")
         self._notification_icon_path = asset_path("bell.svg")
         self._zoom_icon_path = asset_path("zoom.svg")
+        self._about_github_icon_path = asset_path("about-github.svg")
+        self._about_email_icon_path = asset_path("about-email.svg")
+        self._about_whatsapp_icon_path = asset_path("about-whatsapp.svg")
         self._workspace_icon_provider = ExtensionIconProvider(self._theme_mode)
         self._startup_prompt_shown = False
+        self._about_icon_cache: dict[str, QIcon] = {}
         self._codinx_site_url = "https://codinx.app"
         self._codinx_support_url = "https://codinx.app/support"
         self._about_social_links = {
-            "GitHub": "https://codinx.app/github",
-            "Email": "https://codinx.app/email",
-            "WhatsApp": "https://codinx.app/whatsapp",
+            "GitHub": "https://github.com/nathanlobo",
+            "Email": "mailto:lobonathan2209@gmail.com",
+            "WhatsApp": "https://wa.me/+919689137817",
+            "Support": self._codinx_support_url,
         }
 
         self._build_actions()
@@ -635,6 +641,9 @@ class MainWindow(QMainWindow):
         return dialog
 
     def _is_valid_directory(self, path_text: str) -> bool:
+        if not str(path_text).strip():
+            return False
+
         path = Path(path_text).expanduser()
         return path.exists() and path.is_dir()
 
@@ -2086,33 +2095,55 @@ class MainWindow(QMainWindow):
         hero_layout.setContentsMargins(16, 16, 16, 16)
         hero_layout.setSpacing(14)
 
-        logo = QLabel()
-        logo.setFixedSize(self._scaled(72), self._scaled(72))
-        logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        logo.setStyleSheet(
-            """
-            QLabel {
-                border-radius: 18px;
-                background: #0e639c;
-                color: #ffffff;
-                font-size: 28px;
-                font-weight: 700;
-            }
-            """
-        )
-        if self._logo_path.exists():
-            pixmap = QPixmap(str(self._logo_path)).scaled(
-                self._scaled(64),
-                self._scaled(64),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            logo.setPixmap(pixmap)
-            logo.setStyleSheet("QLabel { background: transparent; }")
-        else:
-            logo.setText("TC")
+        logo_stack = QVBoxLayout()
+        logo_stack.setSpacing(self._scaled(6))
 
-        hero_layout.addWidget(logo)
+        recent_logo = QLabel()
+        recent_logo.setFixedSize(self._scaled(62), self._scaled(62))
+        recent_logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        recent_pixmap = self._scaled_asset_pixmap(self._recent_logo_path, self._scaled(56))
+        if recent_pixmap is not None:
+            recent_logo.setPixmap(recent_pixmap)
+            recent_logo.setStyleSheet("QLabel { background: transparent; }")
+        else:
+            recent_logo.setText("TC")
+            recent_logo.setStyleSheet(
+                """
+                QLabel {
+                    border-radius: 16px;
+                    background: #0e639c;
+                    color: #ffffff;
+                    font-size: 24px;
+                    font-weight: 700;
+                }
+                """
+            )
+
+        legacy_logo = QLabel()
+        legacy_logo.setFixedSize(self._scaled(62), self._scaled(62))
+        legacy_logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        legacy_pixmap = self._scaled_asset_pixmap(self._logo_path, self._scaled(56))
+        if legacy_pixmap is not None:
+            legacy_logo.setPixmap(legacy_pixmap)
+            legacy_logo.setStyleSheet("QLabel { background: transparent; }")
+        else:
+            legacy_logo.setText("TC")
+            legacy_logo.setStyleSheet(
+                """
+                QLabel {
+                    border-radius: 16px;
+                    background: #0e639c;
+                    color: #ffffff;
+                    font-size: 24px;
+                    font-weight: 700;
+                }
+                """
+            )
+
+        logo_stack.addWidget(recent_logo, 0, Qt.AlignmentFlag.AlignHCenter)
+        logo_stack.addWidget(legacy_logo, 0, Qt.AlignmentFlag.AlignHCenter)
+        logo_stack.addStretch(1)
+        hero_layout.addLayout(logo_stack)
 
         text_column = QVBoxLayout()
         text_column.setSpacing(4)
@@ -2155,15 +2186,17 @@ class MainWindow(QMainWindow):
         social_row = QHBoxLayout()
         social_row.setSpacing(8)
         social_buttons = [
-            ("GitHub", "G", "#24292e", self._about_social_links["GitHub"]),
-            ("Email", "E", "#0e639c", self._about_social_links["Email"]),
-            ("WhatsApp", "W", "#25d366", self._about_social_links["WhatsApp"]),
+            ("GitHub", "github", self._about_social_links["GitHub"]),
+            ("Email", "email", self._about_social_links["Email"]),
+            ("WhatsApp", "whatsapp", self._about_social_links["WhatsApp"]),
+            ("Support", "support", self._about_social_links["Support"]),
         ]
-        for label, badge, color, url in social_buttons:
+        for label, icon_name, url in social_buttons:
             button = QToolButton()
             button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
             button.setText(label)
-            button.setIcon(self._badge_icon(badge, color))
+            button.setIcon(self._about_social_icon(icon_name))
+            button.setIconSize(QSize(self._scaled(20), self._scaled(20)))
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             button.clicked.connect(lambda _checked=False, target=url: QDesktopServices.openUrl(QUrl(target)))
             social_row.addWidget(button)
@@ -2181,25 +2214,43 @@ class MainWindow(QMainWindow):
 
         dialog.exec()
 
-    def _badge_icon(self, letter: str, color: str) -> QIcon:
-        size = self._scaled(22)
-        pixmap = QPixmap(size, size)
-        pixmap.fill(Qt.GlobalColor.transparent)
+    def _scaled_asset_pixmap(self, asset_path: Path, size: int) -> QPixmap | None:
+        if not asset_path.exists():
+            return None
 
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(color))
-        painter.drawEllipse(QRectF(0, 0, size, size))
+        pixmap = QPixmap(str(asset_path))
+        if pixmap.isNull():
+            return None
 
-        font = painter.font()
-        font.setBold(True)
-        font.setPointSize(max(8, self._scaled(10)))
-        painter.setFont(font)
-        painter.setPen(QColor("#ffffff"))
-        painter.drawText(QRectF(0, 0, size, size), Qt.AlignmentFlag.AlignCenter, letter)
-        painter.end()
-        return QIcon(pixmap)
+        return pixmap.scaled(
+            size,
+            size,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+
+    def _about_social_icon(self, kind: str) -> QIcon:
+        cached_icon = self._about_icon_cache.get(kind)
+        if cached_icon is not None:
+            return cached_icon
+
+        if kind == "support":
+            icon = QIcon(str(self._recent_logo_path))
+            self._about_icon_cache[kind] = icon
+            return icon
+
+        icon_paths = {
+            "github": self._about_github_icon_path,
+            "email": self._about_email_icon_path,
+            "whatsapp": self._about_whatsapp_icon_path,
+        }
+        icon_path = icon_paths.get(kind)
+        if icon_path is not None and icon_path.exists():
+            icon = QIcon(str(icon_path))
+            self._about_icon_cache[kind] = icon
+            return icon
+
+        return QIcon()
 
     def _log_color_for_line(self, line: str) -> QColor:
         theme_colors = self._theme_colors()

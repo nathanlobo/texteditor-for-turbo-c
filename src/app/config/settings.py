@@ -5,22 +5,25 @@ from pathlib import Path
 
 
 def resolve_dosbox_executable_path(dosbox_exe: str, turboc_root: str) -> Path | None:
-    turbo_root = Path(turboc_root).expanduser()
-    if turbo_root.exists() and turbo_root.is_dir():
-        likely_candidates = [
-            turbo_root / "DOSBox-0.74" / "DOSBox.exe",
-            turbo_root / "DOSBox.exe",
-        ]
-        for candidate in likely_candidates:
-            if candidate.exists() and candidate.is_file():
-                return candidate
+    turbo_root_text = turboc_root.strip()
+    if turbo_root_text:
+        turbo_root = Path(turbo_root_text).expanduser()
+        if turbo_root.exists() and turbo_root.is_dir():
+            likely_candidates = [
+                turbo_root / "DOSBox-0.74" / "DOSBox.exe",
+                turbo_root / "DOSBox.exe",
+            ]
+            for candidate in likely_candidates:
+                if candidate.exists() and candidate.is_file():
+                    return candidate
 
-        for candidate in turbo_root.rglob("DOSBox.exe"):
-            if candidate.is_file():
-                return candidate
+            for candidate in turbo_root.rglob("DOSBox.exe"):
+                if candidate.is_file():
+                    return candidate
 
-    if dosbox_exe:
-        explicit_path = Path(dosbox_exe).expanduser()
+    explicit_path_text = dosbox_exe.strip()
+    if explicit_path_text:
+        explicit_path = Path(explicit_path_text).expanduser()
         if explicit_path.exists() and explicit_path.is_file():
             return explicit_path
 
